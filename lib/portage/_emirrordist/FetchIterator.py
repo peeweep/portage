@@ -202,12 +202,7 @@ def _async_fetch_tasks(config, hash_filter, repo_config, digests_future, cpv, lo
                 # skip mirror-restricted files unless override via mirror+
                 # or in config_mirror_exemptions
                 if restrict_mirror and not override_mirror:
-                    if config.restrict_mirror_exemptions is None or not uri.startswith(
-                        "mirror://"
-                    ):
-                        continue
-                    mirror_name = uri.split("/", 3)[2]
-                    if mirror_name not in config.restrict_mirror_exemptions:
+                    if config.restrict_mirror_exemptions is None:
                         continue
                 # if neither fetch or mirror restriction applies to the URI
                 # or it is exempted from them, readd it (with fetch+/mirror+
