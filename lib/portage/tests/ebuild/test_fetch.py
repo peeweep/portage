@@ -19,6 +19,7 @@ from portage._emirrordist.Config import Config as EmirrordistConfig
 from portage.checksum import checksum_str
 from portage.const import BASH_BINARY, MANIFEST2_HASH_DEFAULTS, PORTAGE_PYM_PATH
 from portage.package.ebuild.config import config
+from portage.locks import lockfile, unlockfile
 from portage.package.ebuild.digestgen import digestgen
 from portage.package.ebuild.fetch import (
     ContentHashLayout,
@@ -27,6 +28,7 @@ from portage.package.ebuild.fetch import (
     FlatLayout,
     MirrorLayoutConfig,
     _download_suffix,
+    async_fetch as async_fetch_files,
     fetch,
 )
 from portage.tests import TestCase
@@ -119,9 +121,15 @@ class EbuildFetchTestCase(TestCase):
     def _fetch_post_terminate(pw, proc):
         pw.send(proc.pid)
 
-    def testEbuildFetch(self):
+    def testEbuildFetchConcurrent(self):
+        self.testEbuildFetch(jobs="2")
+
+    def testEbuildFetch(self, jobs="1"):
         user_config = {
-            "make.conf": ('GENTOO_MIRRORS="{scheme}://{host}:{port}"',),
+            "make.conf": (
+                'GENTOO_MIRRORS="{scheme}://{host}:{port}"',
+                'PORTAGE_FETCH_JOBS="' + jobs + '"',
+            ),
         }
 
         distfiles = {
@@ -465,6 +473,28 @@ class EbuildFetchTestCase(TestCase):
                 for k in settings["AA"].split():
                     with open(os.path.join(settings["DISTDIR"], k), "rb") as f:
                         self.assertEqual(f.read(), distfiles[k])
+
+                # A lock held by another coroutine must not block the event
+                # loop or make a normal fetch skip verification.
+                async def test_lock_wait():
+                    filename = settings["AA"].split()[0]
+                    file_lock = lockfile(
+                        os.path.join(settings["DISTDIR"], filename), wantnewlockfile=1
+                    )
+                    task = asyncio.ensure_future(
+                        async_fetch_files({filename: ()}, settings)
+                    )
+                    try:
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                    finally:
+                        unlockfile(file_lock)
+                        if not task.done():
+                            # The unlocked file already has a valid digest.
+                            await asyncio.wait_for(task, 5)
+                    self.assertEqual(task.result(), 1)
+
+                loop.run_until_complete(test_lock_wait())
 
                 # Test digestgen with fetch
                 os.unlink(os.path.join(os.path.dirname(ebuild_path), "Manifest"))

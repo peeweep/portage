@@ -18,6 +18,7 @@ import stat
 import sys
 import tempfile
 import time
+from asyncio import gather
 from collections import OrderedDict
 from urllib.parse import quote as urlquote
 from urllib.parse import urlparse
@@ -861,6 +862,82 @@ async def async_fetch(
     allow_missing_digests=True,
     force=False,
 ):
+    try:
+        jobs = int(mysettings.get("PORTAGE_FETCH_JOBS", "1"))
+        if jobs < 1:
+            raise ValueError
+    except ValueError:
+        writemsg(
+            _("!!! PORTAGE_FETCH_JOBS must be a positive integer; using 1.\n"),
+            noiselevel=-1,
+        )
+        jobs = 1
+
+    kwargs = dict(
+        listonly=listonly,
+        fetchonly=fetchonly,
+        locks_in_subdir=locks_in_subdir,
+        use_locks=use_locks,
+        try_mirrors=try_mirrors,
+        digests=digests,
+        allow_missing_digests=allow_missing_digests,
+        force=force,
+    )
+    if jobs == 1 or listonly:
+        return await _async_fetch(myuris, mysettings, **kwargs)
+
+    # Keep alternative URIs for the same distfile in one job. Also accept
+    # the legacy URI iterable supported by fetch().
+    if hasattr(myuris, "items"):
+        files = list(myuris.items())
+    else:
+        grouped = OrderedDict()
+        for uri in myuris:
+            alternatives = grouped.setdefault(os.path.basename(uri), [])
+            if urlparse(uri).scheme:
+                alternatives.append(uri)
+        files = list(grouped.items())
+
+    if len(files) < 2:
+        return await _async_fetch(
+            myuris if hasattr(myuris, "items") else dict(files), mysettings, **kwargs
+        )
+
+    pending = iter(files)
+
+    async def worker():
+        success = True
+        for filename, uris in pending:
+            if not await _async_fetch({filename: uris}, mysettings, **kwargs):
+                success = False
+                if not fetchonly and "PORTAGE_PARALLEL_FETCHONLY" not in mysettings:
+                    break
+        return success
+
+    tasks = [asyncio.ensure_future(worker()) for _ in range(min(jobs, len(files)))]
+    try:
+        return int(all(await gather(*tasks)))
+    finally:
+        # Await cleanup so downloader processes and distfile locks cannot
+        # outlive a cancelled or failed fetch operation.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await gather(*tasks, return_exceptions=True)
+
+
+async def _async_fetch(
+    myuris,
+    mysettings,
+    listonly=0,
+    fetchonly=0,
+    locks_in_subdir=".locks",
+    use_locks=1,
+    try_mirrors=1,
+    digests=None,
+    allow_missing_digests=True,
+    force=False,
+):
     from portage.package.ebuild.config import check_config_instance
 
     if force and digests:
@@ -1313,21 +1390,26 @@ async def async_fetch(
                         has_space = False
 
             if distdir_writable and use_locks:
-                lock_kwargs = {}
-                if fetchonly:
-                    lock_kwargs["flags"] = os.O_NONBLOCK
-
-                try:
-                    file_lock = lockfile(myfile_path, wantnewlockfile=1, **lock_kwargs)
-                except TryAgain:
-                    writemsg(
-                        _(
-                            ">>> File '%s' is already locked by "
-                            "another fetcher. Continuing...\n"
+                # Never block the event loop while another job (including
+                # a mirror layout fetch) may need it in order to unlock.
+                while file_lock is None:
+                    try:
+                        file_lock = lockfile(
+                            myfile_path, wantnewlockfile=1, flags=os.O_NONBLOCK
                         )
-                        % myfile,
-                        noiselevel=-1,
-                    )
+                    except TryAgain:
+                        if fetchonly:
+                            writemsg(
+                                _(
+                                    ">>> File '%s' is already locked by "
+                                    "another fetcher. Continuing...\n"
+                                )
+                                % myfile,
+                                noiselevel=-1,
+                            )
+                            break
+                        await asyncio.sleep(0.1)
+                if file_lock is None:
                     continue
         try:
             if not listonly:
